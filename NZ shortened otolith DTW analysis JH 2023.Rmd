@@ -1,0 +1,452 @@
+---
+title: "NZ shortened otolith DTW analysis"
+author: "Jens Hegg"
+date: "09/07/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r required libraries, include=FALSE}
+library(readbulk)
+library(dtwclust)
+library(ggplot2)
+library(changepoint)
+library(reshape2)
+library(tidyr)
+library(dplyr)
+library(plotly)
+library(knitr)
+library(mclust)
+library(plyr)
+library(rockchalk)
+library(scales)
+library(zoo)
+library(psych)
+library(doParallel)
+library(bigmemory)
+library(ggdendro)
+library(cluster)
+library(forcats)
+library(dendextend)
+library(factoextra)
+library(ggpubr)
+library(gdata)
+library(forecast)
+library(GGally)
+library(readxl)
+library(purrr)
+
+
+
+```
+
+This RMD is the same as the prior analysis except that we are cutting off the adult portion of the otoliths so that we're comparing similar lengths and therefore life-histories between modern and older otoliths. 
+
+```{r reading in data, include=FALSE}
+
+#First thing to do is to read in all the otolith data and combine it into a single long file.
+
+#No background data
+
+#Read in Excel file as all sheets into one dataframe (uses purrr)
+
+file <- '/Users/hegg1432/Dropbox/NZ Otolith DTW Analysis/Raw data files from Armagan/New Data 2023/DTW Mastersheet 2023 Updated JH.xlsx'
+
+sheets <- excel_sheets(file)
+
+raw_data_NZ  <- map_df(sheets, ~ read_excel(file, na = "NA", sheet = .x))
+
+#Change otolith column name to fit scripts
+colnames(raw_data_NZ)[17] = "OtoID"
+
+```
+
+```{r LOD and other background data}
+#There is no provided LOD or other background data
+```
+
+```{r calculating microns from core, echo=FALSE}
+
+#all elapsed time needs to be made into microns from the core
+# Scans were 10 microns/sec
+
+raw_data_NZ$microns = raw_data_NZ$ElapsedTime_s * 10
+
+
+```
+
+```{r Finding max time for each otolith}
+#finding the maximum for each otolith so that we can re-create microns after data is smoothed. 
+
+#finding max microns for each otolith 
+maxes_NZ = by(raw_data_NZ, raw_data_NZ$OtoID, function(x) max(x$microns))
+maxes_NZ = do.call(rbind, as.list(maxes_NZ))
+maxes_names__NZ = as.data.frame(row.names(maxes_NZ))
+maxes_NZ = cbind(maxes_NZ, maxes_names__NZ)
+colnames(maxes_NZ) = c("max_microns", "OtoID")
+```
+```{r summarizing otolith names and locations for later use}
+
+OtoID_Location_NZ = raw_data_NZ[, c("OtoID","Location", "Time_Period", "Occupation_layer", "Occupation_layer_text")]
+
+OtoID_Location_NZ = OtoID_Location_NZ %>% distinct()
+
+##Otata Idaland C4 has a mistake in the layer row. Deleting that one line
+OtoID_Location_NZ = OtoID_Location_NZ[-21,]
+
+```
+```{r investigating clipping of otolith data}
+
+mean_CaCPS = mean(raw_data_NZ$Ca43_CPS)
+
+Ca_CPS_hist = gghistogram(raw_data_NZ$Ca43_CPS) +
+  geom_vline(xintercept = mean_CaCPS, color = "red") + 
+  theme_bw()
+
+Ca_CPS_hist
+
+#distribution is strangely bimodal. Not sure what the deal is there. But, there are some low values that indicate poor clipping of the data. Easiest is to decide on a cutoff value on the trailing edge of the mean distribution. Most involved is to plot each one and decide on a cutoff for each otolith. Going to try the easy way and see how it goes. 
+
+CPS_cutoff_value = 15000
+
+Ca_CPS_hist_cutoff = Ca_CPS_hist + 
+  geom_vline(xintercept = CPS_cutoff_value, color = "blue") +
+  coord_cartesian(xlim = c(0, mean_CaCPS), ylim = c(0, 2500)) +
+  theme_bw()
+
+
+Ca_CPS_hist_cutoff
+```
+```{r removing low Ca CPS data}
+
+trimmed_data_NZ = subset(raw_data_NZ, raw_data_NZ$Ca43_CPS > CPS_cutoff_value)
+
+trimmed_Ca_CPS_hist = gghistogram(trimmed_data_NZ$Ca43_CPS)
+
+trimmed_Ca_CPS_hist +
+  theme_bw()
+```
+
+``` {r creating list of data for DTW}
+#------------------------------------------------------------
+# Making list of multivariate transects for DTW
+#------------------------------------------------------------
+
+#split into list by OtoID column
+trimmed_data_NZ_list = split(trimmed_data_NZ[,4:16], trimmed_data_NZ$OtoID)
+
+#removing outlier data with three rounds of tsclean() from {forecast}, then smoothing using a rolling average since the plots are really difficult to interpret due to noise
+
+#Doubtless/Harukai outlier detection and smoothing
+trimmed_data_NZ_smooth = lapply(trimmed_data_NZ_list, function(df){
+  
+    #running tsclean() three times to remove outliers
+    ts <- ts(df)
+      
+      for (i in 1:ncol(ts)) {
+        df[, i] <- tsclean(ts[, i])
+      }
+    
+      for (i in 1:ncol(ts)) {
+          df[, i] <- tsclean(ts[, i])
+      }
+    
+      for (i in 1:ncol(ts)) {
+        df[, i] <- tsclean(ts[, i])
+      }
+      
+      #Applying a strong rolling average to deal with noise
+      x = rollapply(df, width=100, FUN=mean, by.column=TRUE, fill=c(NA, 0, NA), align="right")
+  
+    return(as.data.frame(na.omit(x)))
+    
+  }
+)
+
+#average length of otoliths 
+length_data_NZ = lapply(trimmed_data_NZ_smooth, dim)
+
+av_length_data_NZ = colMeans(do.call(rbind,length_data_NZ))
+av_length_data_NZ
+
+#reinterpolate to the mean length
+data_NZ_list_reinterp = lapply(trimmed_data_NZ_smooth, function(x) reinterpolate(t(as.matrix(x)), 1392L))
+
+#turn all the matrices back over. why this function deals with everything in different orientations is mystifying
+data_NZ_list_reinterp = lapply(data_NZ_list_reinterp, FUN=t)
+
+#dtwclust freaks out unless the data is in matrix but having it as a dataframe is easier to deal with
+data_NZ_list_reinterp_df = lapply(data_NZ_list_reinterp, FUN=as.data.frame)
+```
+
+```{r creating dataframe from smoothed data}
+#Creating dataframe from list of smoothed/outlier corrected lists for use in plotting later
+
+trimmed_data_NZ_smooth_df = bind_rows(trimmed_data_NZ_smooth, .id = "OtoID")
+
+#Add max column and recreate microns for smoothed data
+trimmed_data_NZ_smooth_df$maxes = maxes_NZ$max_microns[match(trimmed_data_NZ_smooth_df$OtoID, maxes_NZ$OtoID)]
+
+#Add sequence column to calculate microns from max
+trimmed_data_NZ_smooth_df$seq <- with(trimmed_data_NZ_smooth_df, ave(seq_along(OtoID), OtoID, FUN=seq_along))
+
+#max seq of each otolith
+#finding max microns for each otolith 
+max_seq_NZ = by(trimmed_data_NZ_smooth_df, trimmed_data_NZ_smooth_df$OtoID, function(x) max(x$seq))
+max_seq_NZ = do.call(rbind, as.list(max_seq_NZ))
+max_seq_names_NZ = as.data.frame(row.names(max_seq_NZ))
+max_seq_NZ = cbind(max_seq_NZ, max_seq_names_NZ)
+colnames(max_seq_NZ) = c("max_seq", "OtoID")
+
+trimmed_data_NZ_smooth_df$max_seq = max_seq_NZ$max_seq[match(trimmed_data_NZ_smooth_df$OtoID, max_seq_NZ$OtoID)]
+
+trimmed_data_NZ_smooth_df$microns = (trimmed_data_NZ_smooth_df$maxes/trimmed_data_NZ_smooth_df$max_seq)*trimmed_data_NZ_smooth_df$seq
+  
+trimmed_data_NZ_smooth_df = merge(trimmed_data_NZ_smooth_df, OtoID_Location_NZ, by = "OtoID")
+```
+
+
+```{r calculating descriptive statistics to cluster}
+#------------------------------------------------------------
+# Making dataframe of descriptive statistics (mean, sd, skew) to do a primary clustering on in case mean makes a difference
+#------------------------------------------------------------
+
+#creates discriptive statistics on the reinterpolated data. Could be done on raw data if we thought length was not a factor on mean
+
+descr_stats_combined = 
+aggregate(trimmed_data_NZ_smooth_df[,2:14], list(trimmed_data_NZ_smooth_df$OtoID), mean)
+
+colnames(descr_stats_combined)[1] = "OtoID"
+
+
+#merging location/time info by OtoID
+descr_stats_combined = merge(descr_stats_combined, OtoID_Location_NZ, by = "OtoID")
+```
+
+```{r Clustering on mean first}
+#scaling data
+sc_descr_stats_combined = scale(descr_stats_combined[2:14], center = TRUE, scale = TRUE)
+
+sc_descr_stats_combined = cbind(descr_stats_combined[c(1, 15)], as.data.frame(sc_descr_stats_combined))
+
+#using mClust to cluster on all columns
+mclust_combined = Mclust(as.data.frame(sc_descr_stats_combined[,3:15]))
+
+#The groupings are hard to decipher. Not super clear cut
+#plot(mclust_combined)
+
+#adding classifications to dataframe
+sc_descr_stats_combined$mclust_class = mclust_combined$classification
+```
+
+```{r plotting labelled by known category}
+
+combined_test_plot = ggplot(sc_descr_stats_combined, aes(x=Sr_ug_g_m88, y=Na_ug_g_m23, color = Location))+
+  geom_point() +
+  theme_bw()
+
+combined_test_plot
+
+#Pairs plot (requires GGally package)
+
+combined_pairs_plot = ggpairs(sc_descr_stats_combined, columns = 4:16, aes(color = as.factor(mclust_class)))
+
+combined_pairs_plot
+
+#pairs plot shows Na, K, BA, as well as Al, P, Mn, Sr as the major contrasts where there are differences between the two locations. I'm not sure they are separable entirely, but possible. It is possible that DTW isn't really that interesting if they can be. 
+```
+
+```{r DTW clustering of time series}
+#Timing the process
+#Starting the clock
+ptm <- proc.time()
+
+# #Subsetting to elements I know to try to get some meaningful plots
+# Doubtless_Harukai_list_reinterp_coreElements = lapply(combined_data_list_smooth_reinterp, function(x) x[,c(3,7,11,12)])
+
+##Running the DTW cluster analysis
+
+#running with 8 parallel processors since I think this will be a long calculation
+require("doParallel")
+# Create parallel workers
+workers <- makeCluster(8L)
+# Preload dtwclust in each worker; not necessary but useful
+invisible(clusterEvalQ(workers, library("dtwclust")))
+# Register the backend; this step MUST be done
+registerDoParallel(workers)
+
+#running the actual clustering
+combined_dtw_heir_clust_MV = tsclust(series = data_NZ_list_reinterp, 
+                               preproc = zscore, 
+                               k = 4,
+                               type = "hierarchical", 
+                               distance="DTW", 
+                               window.size=100, 
+                               control=hierarchical_control(method="ward.D"), 
+                               trace=TRUE)
+
+# Stop parallel workers
+stopCluster(workers)
+# Go back to sequential computation
+registerDoSEQ()
+
+# Stoping the clock
+proc.time() - ptm
+
+##last time it was run on Doubtless_Harukai
+#   user  system elapsed 
+#  3.731   5.692 867.317 - 14minutes!!
+
+# Last time this was run on combined dataset
+#Elapsed time is 2023.248 seconds - 34 minutes!
+# 
+#     user   system  elapsed 
+#    6.615    9.810 2030.991 
+#
+#Run on combined data for 2023
+#Elapsed time is 1489.55 seconds.
+# 
+#     user   system  elapsed 
+#    5.432    5.132 1503.553 - 33 minutes! Not bad for quite a bit more data
+
+# Elapsed time is 1192.192 seconds. (08/16/2023)
+# 
+#     user   system  elapsed 
+#    4.328    4.273 1208.754 - 12 minutes. Wow! this ran alot faster
+```
+
+```{r detailed dendrograms of all data}
+
+# dendrogram just to see what it looks like
+fviz_dend(combined_dtw_heir_clust_MV,               
+          k=8, # Cut in seven groups
+          ylim = c(0, 200000),
+          cex = 0.5, 
+          show_labels = FALSE, 
+          color_labels_by_k = FALSE, 
+          k_colors = "jco",
+          rect = TRUE, 
+          rect_border = "jco", 
+          rect_fill = TRUE, 
+          #color_labels_by_k = TRUE,                 # color labels by groups
+          horiz = FALSE,
+          ggtheme = theme_void()                       # Change theme
+          )
+
+#looking at this dendrogram 7 clusters looks logical
+combined_cuts_MV = as.data.frame(cutree(combined_dtw_heir_clust_MV,
+                                  k=8,
+                                  order_clusters_as_data = FALSE))
+colnames(combined_cuts_MV) = "Hier_Clust_5"
+combined_cuts_MV$OtoID = rownames(combined_cuts_MV)
+
+## Silhouette for hierarchical clusters
+#checking cluster decision
+sillouette_DH_MV = cvi(combined_dtw_heir_clust_MV, type = "valid")
+
+#merge with un-interpolated but smoothed/outlier removed time-series and plot 
+combined_DTW_transects = merge(combined_cuts_MV, trimmed_data_NZ_smooth_df, by = "OtoID")
+
+##melt the data to plot
+combined_DTW_melt_for_plot_MV=melt(combined_DTW_transects, id.vars=c("OtoID", "Hier_Clust_5", "microns", "maxes", "max_seq", "seq", "Location", "Time_Period", "Occupation_layer", "Occupation_layer_text"))
+
+colnames(combined_DTW_melt_for_plot_MV)[11:12] = c("Element", "Ratio")
+combined_DTW_melt_for_plot_MV$Element_short = substr(combined_DTW_melt_for_plot_MV$Element, 1,2)
+
+#Sorting dataframe
+combined_DTW_melt_for_plot_MV = combined_DTW_melt_for_plot_MV[order(combined_DTW_melt_for_plot_MV$OtoID, combined_DTW_melt_for_plot_MV$microns),]
+
+# #Combining with Time period and occupation layer data
+# combined_DTW_melt_for_plot_MV = merge(combined_DTW_melt_for_plot_MV, OtoID_Location_NZ)
+
+#Unique elements analyzed
+unique_elements = as.vector(unique(combined_DTW_melt_for_plot_MV$Element_short))
+
+##create pdf where each page is a separate plot.
+#prints until dev.off is called
+pdf("Transect_7Group_by_TimePeriod_plots.pdf", width = 11, height = 8.5)
+
+for (i in 1:length(unique_elements)) {
+
+#creating facet plot
+print(ggplot(data=combined_DTW_melt_for_plot_MV[ which(combined_DTW_melt_for_plot_MV$Element_short == unique_elements[i]),], aes(x=microns, y=Ratio)) +
+  geom_line(aes(color = Location, group = OtoID), size=0.2) +
+  facet_grid(Time_Period~Hier_Clust_5) +
+  guides(x = guide_axis(n.dodge = 2)) +
+  scale_color_manual(values = c("#d01e89", "#9bd2a4", "#ff7f00", "#984ea3", "#e41a1c", "#377eb8", "#4daf4a", "#cab2d6")) +
+  theme_bw()+
+  guides(color = guide_legend(override.aes = list(size=5))) +
+  labs(x="Microns from Otolith Core", y = paste(unique_elements[i], "(ug/g)"), title = paste(unique_elements[i], "by Group & Time Period"))
+)
+
+}
+dev.off()
+
+#unique otolith classification information
+Otolith_Classification_Data = unique(combined_DTW_melt_for_plot_MV[,c(1:2, 7:10)])
+
+colnames(Otolith_Classification_Data)[2] = "Hier_Cluster"
+```
+
+
+```{r plotting layers data}
+
+#datasest with only the otoliths that have layer info
+layer_data = subset(combined_DTW_melt_for_plot_MV, (!is.na(combined_DTW_melt_for_plot_MV[,9])))
+
+
+##create pdf where each page is a separate plot.
+#prints until dev.off is called
+pdf("Transect_Layers_by_TimePeriod_plots.pdf", width = 11, height = 8.5)
+
+for (i in 1:length(unique_elements)) {
+
+#creating facet plot
+print(ggplot(data=layer_data[ which(layer_data$Element_short == unique_elements[i]),], aes(x=microns, y=Ratio))+
+  geom_line(aes(color = as.factor(Occupation_layer), group = OtoID), size=0.2) +
+  facet_grid(Time_Period + Location~Hier_Clust_5) +
+  guides(x = guide_axis(n.dodge = 2)) +
+  #coord_cartesian(ylim=c(.705, .7155), xlim = c(0, 1000)) + 
+  #geom_hline(yintercept=0.70918, color="blue")+
+  scale_color_manual(values = c("#ffffb2", "#fecc5c", "#fd8d3c", "#e31a1c"), name="Occupation\nLayer") +
+  theme_bw()+
+  guides(color = guide_legend(override.aes = list(size=5))) +
+  labs(x="Microns from Otolith Core", y = paste(unique_elements[i], "(ug/g)"), title = paste(unique_elements[i], "by Group & Time Period"))# + #+
+  #theme(aspect.ratio = 1) #+
+  #coord_cartesian(ylim = c(0, 12000))
+)
+
+}
+dev.off()
+
+#percentage bar plot of layer data
+
+layer_count_data = unique(layer_data[,c(1:2, 7:9)])
+
+layer_percent_plot_MV = ggplot(layer_count_data, aes(x = as.factor(Hier_Clust_5)))
+
+layer_percent_plot_MV +
+  geom_bar(aes(fill = as.factor(Occupation_layer)), position = "fill") +
+  facet_grid(Time_Period+Location~.) +
+  scale_fill_manual(values = c("#ffffb2", "#fecc5c", "#fd8d3c", "#e31a1c"), name="Occupation\nLayer") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x="Clustering Group", y = "Occupation Layer %", title = "Makeup of Each Cluster Group by Occupation Layer\nLowest = Earliest") +
+  theme_bw()
+  #guides(color = guide_legend(override.aes = list(size=5)))
+
+#table of cluster proportions
+prop_cluster_data_DTW_DH_MV = DH_DTW_melt_for_plot_MV[,c( "File", "Hier_Clust_4")]
+
+cluster_n_DTW_DH_MV = table(droplevels(prop_cluster_data_DTW_DH_MV))
+
+cluster_prop_DTW_DH_MV = round(100*prop.table(cluster_n_DTW_DH_MV, margin = 2), digits = 1)
+
+cluster_n_DTW_DH_MV
+cluster_prop_DTW_DH_MV
+
+cbind(cluster_n_DTW_DH_MV, cluster_prop_DTW_DH_MV)
+
+```
